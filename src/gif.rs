@@ -176,25 +176,24 @@ pub fn build_palette(rgb: &[u8], max_colors: usize) -> Vec<[u8; 3]> {
 pub struct ColorMapper {
     palette: Vec<[u8; 3]>,
     n_content: usize,
-    transparent: u8,
     cache: Vec<u16>, // 32768 项，u16::MAX = 未命中
 }
 
 const CACHE_MISS: u16 = u16::MAX;
 
 impl ColorMapper {
-    pub fn new(palette: Vec<[u8; 3]>, transparent: u8) -> Self {
+    pub fn new(palette: Vec<[u8; 3]>) -> Self {
         let n_content = palette.len();
         Self {
             palette,
             n_content,
-            transparent,
             cache: vec![CACHE_MISS; 32768],
         }
     }
 
-    pub fn transparent(&self) -> u8 {
-        self.transparent
+    /// 取调色板颜色（Floyd–Steinberg 抖动误差回读用）
+    pub fn color(&self, i: u8) -> [u8; 3] {
+        self.palette[i as usize]
     }
 
     /// RGB 输入允许超界（抖动误差），内部会裁剪。返回内容色索引。
@@ -391,32 +390,6 @@ pub fn crop_diff(cur: &[u8], prev: &[u8], w: usize, bbox: (usize, usize, usize, 
 }
 
 // ============================================================
-// 计数写入器
-// ============================================================
-
-pub struct CountingWriter<W: Write> {
-    inner: W,
-    pub count: u64,
-}
-
-impl<W: Write> CountingWriter<W> {
-    pub fn new(inner: W) -> Self {
-        Self { inner, count: 0 }
-    }
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count += n as u64;
-        Ok(n)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-// ============================================================
 // GIF89a 容器写入器
 // ============================================================
 
@@ -445,7 +418,8 @@ impl<W: Write> GifWriter<W> {
         buf.extend_from_slice(b"NETSCAPE2.0");
         buf.extend_from_slice(&[0x03, 0x01, 0x00, 0x00, 0x00]);
         w.write_all(&buf)?;
-        Ok(Self { w, bits, trans: (1 << bits) - 1 })
+        // 透明索引：1u32 先移位再收窄，避免 bits=8 时 u8 溢出
+        Ok(Self { w, bits, trans: ((1u32 << bits) - 1) as u8 })
     }
 
     /// 写一帧。`idx` 为调色板索引流（fw*fh 个）。
@@ -689,7 +663,7 @@ mod tests {
             ],
             5,
         );
-        let mut m = ColorMapper::new(pal, 6);
+        let mut m = ColorMapper::new(pal);
         for r in [0, 50, 128, 200, 255] {
             for g in [0, 50, 128, 200, 255] {
                 for b in [0, 50, 128, 200, 255] {
