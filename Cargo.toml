@@ -1,0 +1,31 @@
+[package]
+name = "bitgalaxy-gifrecorder"
+version = "1.0.0"
+edition = "2024"
+description = "BitGalaxy.GifRecorder - 轻量级 GIF 录屏工具"
+authors = ["BitGalaxy"]
+
+[[bin]]
+name = "bitgalaxy_gifrecorder"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Controls",
+] }
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+# 体积优化：小而轻的单文件 EXE
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
