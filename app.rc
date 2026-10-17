@@ -1,5 +1,10 @@
-// 资源文件：嵌入 manifest 与版本信息
+// 资源文件：嵌入图标、manifest 与版本信息
 #include <windows.h>
+
+#define IDI_APP 101
+
+// 应用图标（exe/安装包/任务栏共用，多尺寸 16-256）
+IDI_APP ICON "assets/app.ico"
 
 1 24 "app.manifest"
 

@@ -1,7 +1,5 @@
-//! GIF89a 编码核心：八叉树量化 + LZW 压缩 + 帧差分工具
-//! 零第三方依赖，流式写入，实时字节计数。
-
-use std::io::{self, Write};
+//! 颜色量化（八叉树）+ 最近邻映射（15-bit 缓存）+ 帧差分工具。
+//! GIF 容器、LZW 压缩、图形控制扩展统一交给成熟的 `gif` crate 编码。
 
 // ============================================================
 // 八叉树量化 (Octree Color Quantization)
@@ -227,114 +225,47 @@ impl ColorMapper {
 }
 
 // ============================================================
-// LZW 压缩（GIF 变体，LSB-first 位打包）
+// Floyd–Steinberg 抖动映射（RGB → 调色板索引帧）
 // ============================================================
 
-/// 子块流写入器：GIF 数据按 ≤255 字节子块存储
-struct SubBlockWriter {
-    out: Vec<u8>,
-    block: Vec<u8>,
-}
-
-impl SubBlockWriter {
-    fn new() -> Self {
-        Self { out: Vec::new(), block: Vec::new() }
-    }
-    fn push(&mut self, b: u8) {
-        self.block.push(b);
-        if self.block.len() == 255 {
-            self.out.push(255);
-            let mut b = std::mem::take(&mut self.block);
-            self.out.append(&mut b);
+/// RGB 像素缓冲 → 索引帧。两行滚动误差缓冲，x 侧加 1 偏移免边界判断。
+pub fn dither_map(rgb: &[u8], w: usize, h: usize, m: &mut ColorMapper) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    let mut cur = vec![[0i32; 3]; w + 2];
+    let mut nxt = vec![[0i32; 3]; w + 2];
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let p = (row + x) * 3;
+            let i = x + 1;
+            let old_r = rgb[p] as i32 + cur[i][0];
+            let old_g = rgb[p + 1] as i32 + cur[i][1];
+            let old_b = rgb[p + 2] as i32 + cur[i][2];
+            let idx = m.map(old_r, old_g, old_b);
+            out[row + x] = idx;
+            let pc = m.color(idx);
+            // 误差以裁剪后的原值为基准
+            let er = old_r.clamp(0, 255) - pc[0] as i32;
+            let eg = old_g.clamp(0, 255) - pc[1] as i32;
+            let eb = old_b.clamp(0, 255) - pc[2] as i32;
+            // 7/16 → 右邻；3/16 → 左下；5/16 → 正下；1/16 → 右下
+            cur[i + 1][0] += (er * 7) >> 4;
+            cur[i + 1][1] += (eg * 7) >> 4;
+            cur[i + 1][2] += (eb * 7) >> 4;
+            nxt[i - 1][0] += (er * 3) >> 4;
+            nxt[i - 1][1] += (eg * 3) >> 4;
+            nxt[i - 1][2] += (eb * 3) >> 4;
+            nxt[i][0] += (er * 5) >> 4;
+            nxt[i][1] += (eg * 5) >> 4;
+            nxt[i][2] += (eb * 5) >> 4;
+            nxt[i + 1][0] += er >> 4;
+            nxt[i + 1][1] += eg >> 4;
+            nxt[i + 1][2] += eb >> 4;
         }
+        std::mem::swap(&mut cur, &mut nxt);
+        nxt.iter_mut().for_each(|v| *v = [0; 3]);
     }
-    fn finish(mut self) -> Vec<u8> {
-        if !self.block.is_empty() {
-            self.out.push(self.block.len() as u8);
-            let mut b = std::mem::take(&mut self.block);
-            self.out.append(&mut b);
-        }
-        self.out.push(0); // 子块终结符
-        self.out
-    }
-}
-
-struct LzwBitWriter {
-    out: SubBlockWriter,
-    cur: u32,
-    nbits: u32,
-}
-
-impl LzwBitWriter {
-    fn new() -> Self {
-        Self { out: SubBlockWriter::new(), cur: 0, nbits: 0 }
-    }
-    fn emit(&mut self, code: u16, size: u32) {
-        self.cur |= (code as u32) << self.nbits;
-        self.nbits += size;
-        while self.nbits >= 8 {
-            let b = self.cur as u8;
-            self.out.push(b);
-            self.cur >>= 8;
-            self.nbits -= 8;
-        }
-    }
-    fn flush(&mut self) {
-        if self.nbits > 0 {
-            let b = self.cur as u8;
-            self.out.push(b);
-            self.cur = 0;
-            self.nbits = 0;
-        }
-    }
-}
-
-/// LZW 编码，返回完整子块流（含终结符 0x00）
-/// 字典用 4096×256 平面数组，查表 O(1)
-pub fn lzw_encode(min_code_size: u8, data: &[u8]) -> Vec<u8> {
-    let clear = 1u16 << min_code_size;
-    let eoi = clear + 1;
-    let mut dict = vec![0xFFFFu16; 4096 * 256];
-    let mut w = LzwBitWriter::new();
-    let mut code_size = min_code_size as u32 + 1;
-    let mut next_code = clear + 2;
-
-    w.emit(clear, code_size);
-    if data.is_empty() {
-        w.emit(eoi, code_size);
-        w.flush();
-        return w.out.finish();
-    }
-
-    let mut prefix = data[0] as u16;
-    for &k in &data[1..] {
-        let slot = prefix as usize * 256 + k as usize;
-        let next = dict[slot];
-        if next != 0xFFFF {
-            prefix = next;
-        } else {
-            w.emit(prefix, code_size);
-            if next_code < 4096 {
-                dict[slot] = next_code;
-                next_code += 1;
-                // 与解码端同步的码长增长规则
-                if next_code as u32 == (1u32 << code_size) && code_size < 12 {
-                    code_size += 1;
-                }
-            } else {
-                // 字典满：发 CLEAR 重置
-                w.emit(clear, code_size);
-                dict.fill(0xFFFF);
-                next_code = clear + 2;
-                code_size = min_code_size as u32 + 1;
-            }
-            prefix = k as u16;
-        }
-    }
-    w.emit(prefix, code_size);
-    w.emit(eoi, code_size);
-    w.flush();
-    w.out.finish()
+    out
 }
 
 // ============================================================
@@ -390,253 +321,12 @@ pub fn crop_diff(cur: &[u8], prev: &[u8], w: usize, bbox: (usize, usize, usize, 
 }
 
 // ============================================================
-// GIF89a 容器写入器
-// ============================================================
-
-pub struct GifWriter<W: Write> {
-    w: W,
-    bits: u8,       // 调色板位数 4..=8
-    trans: u8,      // 透明索引 = (1<<bits)-1
-}
-
-impl<W: Write> GifWriter<W> {
-    /// palette 必须恰好 1<<bits 项（不足处补 0）
-    pub fn new(mut w: W, width: u16, height: u16, palette: &[[u8; 3]], bits: u8) -> io::Result<Self> {
-        debug_assert_eq!(palette.len(), 1usize << bits);
-        let mut buf = Vec::with_capacity(64 + palette.len() * 3);
-        buf.extend_from_slice(b"GIF89a");
-        buf.extend_from_slice(&width.to_le_bytes());
-        buf.extend_from_slice(&height.to_le_bytes());
-        buf.push(0x80 | ((bits - 1) << 4) | (bits - 1)); // 全局色表标志 + 尺寸
-        buf.push(0);
-        buf.push(0);
-        for c in palette {
-            buf.extend_from_slice(c);
-        }
-        // Netscape 循环扩展：无限循环
-        buf.extend_from_slice(&[0x21, 0xFF, 0x0B]);
-        buf.extend_from_slice(b"NETSCAPE2.0");
-        buf.extend_from_slice(&[0x03, 0x01, 0x00, 0x00, 0x00]);
-        w.write_all(&buf)?;
-        // 透明索引：1u32 先移位再收窄，避免 bits=8 时 u8 溢出
-        Ok(Self { w, bits, trans: ((1u32 << bits) - 1) as u8 })
-    }
-
-    /// 写一帧。`idx` 为调色板索引流（fw*fh 个）。
-    /// `use_trans`：帧内是否使用透明索引（帧差分帧为 true）。
-    pub fn write_frame(
-        &mut self,
-        idx: &[u8],
-        left: u16,
-        top: u16,
-        fw: u16,
-        fh: u16,
-        delay_cs: u16,
-        use_trans: bool,
-    ) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(32 + idx.len() / 2);
-        // 图形控制扩展：处置方法=1(保留)，透明标志
-        let packed = 0x04 | if use_trans { 0x01 } else { 0x00 };
-        buf.extend_from_slice(&[0x21, 0xF9, 0x04, packed]);
-        buf.extend_from_slice(&delay_cs.to_le_bytes());
-        buf.push(self.trans);
-        buf.push(0x00);
-        // 图像描述符
-        buf.push(0x2C);
-        buf.extend_from_slice(&left.to_le_bytes());
-        buf.extend_from_slice(&top.to_le_bytes());
-        buf.extend_from_slice(&fw.to_le_bytes());
-        buf.extend_from_slice(&fh.to_le_bytes());
-        buf.push(0x00); // 无局部色表
-        let mcs = self.bits.max(2);
-        buf.push(mcs);
-        let sub = lzw_encode(mcs, idx);
-        buf.extend_from_slice(&sub);
-        self.w.write_all(&buf)
-    }
-
-    pub fn finish(mut self) -> io::Result<()> {
-        self.w.write_all(&[0x3B])?;
-        self.w.flush()
-    }
-}
-
-// ============================================================
-// 单元测试（含迷你 LZW 解码器做往返验证）
+// 单元测试
 // ============================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 测试用迷你 LZW 解码器（GIF 变体）
-    fn lzw_decode(mcs: u8, subblocks: &[u8]) -> Vec<u8> {
-        // 拆子块
-        let mut data = Vec::new();
-        let mut i = 0usize;
-        while i < subblocks.len() {
-            let len = subblocks[i] as usize;
-            if len == 0 {
-                break;
-            }
-            data.extend_from_slice(&subblocks[i + 1..i + 1 + len]);
-            i += 1 + len;
-        }
-        let clear = 1u16 << mcs;
-        let eoi = clear + 1;
-        // LSB-first 位读取器
-        struct BitReader<'a> {
-            data: &'a [u8],
-            pos: usize,
-            acc: u32,
-            bits: u32,
-        }
-        impl<'a> BitReader<'a> {
-            fn read(&mut self, size: u32) -> u16 {
-                while self.bits < size {
-                    self.acc |= (self.data[self.pos] as u32) << self.bits;
-                    self.pos += 1;
-                    self.bits += 8;
-                }
-                let code = (self.acc & ((1 << size) - 1)) as u16;
-                self.acc >>= size;
-                self.bits -= size;
-                code
-            }
-        }
-        let mut br = BitReader { data: &data, pos: 0, acc: 0, bits: 0 };
-        // 字典：前缀 + 尾字节 → 字符串（用 (prefix_code, byte) 链）
-        let mut dict_prefix = vec![0u16; 4096];
-        let mut dict_byte = vec![0u8; 4096];
-        let mut next_code = clear as usize + 2;
-        let mut code_size = mcs as u32 + 1;
-        let mut out: Vec<u8> = Vec::new();
-        let reset = |dict_prefix: &mut Vec<u16>, dict_byte: &mut Vec<u8>, next_code: &mut usize, code_size: &mut u32| {
-            for i in 0..clear as usize {
-                dict_prefix[i] = u16::MAX;
-                dict_byte[i] = i as u8;
-            }
-            *next_code = clear as usize + 2;
-            *code_size = mcs as u32 + 1;
-        };
-        reset(&mut dict_prefix, &mut dict_byte, &mut next_code, &mut code_size);
-        let mut prev: Option<u16> = None;
-        // 沿字典链提取字符串（栈底为首字符）
-        let lookup = |code: u16, dict_prefix: &Vec<u16>, dict_byte: &Vec<u8>| -> (Vec<u8>, u8) {
-            let mut stack: Vec<u8> = Vec::new();
-            let mut c = code;
-            loop {
-                stack.push(dict_byte[c as usize]);
-                if dict_prefix[c as usize] == u16::MAX {
-                    break;
-                }
-                c = dict_prefix[c as usize];
-            }
-            let first_char = stack[stack.len() - 1];
-            stack.reverse();
-            (stack, first_char)
-        };
-        loop {
-            if br.pos > br.data.len() {
-                break;
-            }
-            let code = br.read(code_size);
-            if code == clear {
-                reset(&mut dict_prefix, &mut dict_byte, &mut next_code, &mut code_size);
-                prev = None;
-                continue;
-            }
-            if code == eoi {
-                break;
-            }
-            let (str_bytes, first_char) = if (code as usize) < next_code {
-                // 基础表或动态表中已定义
-                lookup(code, &dict_prefix, &dict_byte)
-            } else if code as usize == next_code {
-                // KwKwK 特殊情形：prev + prev 的首字符
-                let p = prev.expect("KwKwK without prev");
-                let (mut s, fc) = lookup(p, &dict_prefix, &dict_byte);
-                s.push(fc);
-                (s, fc)
-            } else {
-                panic!("corrupt LZW stream: code={} next={}", code, next_code);
-            };
-            out.extend_from_slice(&str_bytes);
-            if let Some(p) = prev {
-                if next_code < 4096 {
-                    dict_prefix[next_code] = p;
-                    dict_byte[next_code] = first_char;
-                    next_code += 1;
-                    // 注意：解码端字典比编码端滞后一拍，码长增长点要提前一拍
-                    if next_code == (1usize << code_size) - 1 && code_size < 12 {
-                        code_size += 1;
-                    }
-                }
-            }
-            prev = Some(code);
-        }
-        out
-    }
-
-    fn roundtrip(data: &[u8], mcs: u8) {
-        let enc = lzw_encode(mcs, data);
-        let dec = lzw_decode(mcs, &enc);
-        assert_eq!(dec, data, "mcs={} len={}", mcs, data.len());
-    }
-
-    #[test]
-    fn test_lzw_debug_codes() {
-        // 基础往返冒烟
-        let data: Vec<u8> = vec![65, 65, 66, 66, 65, 67, 67, 65];
-        roundtrip(&data, 8);
-    }
-
-    #[test]
-    fn test_lzw_roundtrip_basic() {
-        for mcs in 2u8..=8 {
-            // 数据字节必须 < 2^mcs，否则会被解码端当作 CLEAR/EOI 码
-            let n = 1u32 << mcs;
-            roundtrip(&[], mcs);
-            roundtrip(&[0], mcs);
-            roundtrip(&[1, 1, 1, 1], mcs);
-            roundtrip(&(0..n as u16).map(|v| v as u8).collect::<Vec<u8>>(), mcs);
-            let seq: Vec<u8> = (0..1000u32).map(|i| ((i * 37 + i / 11) % n) as u8).collect();
-            roundtrip(&seq, mcs);
-        }
-    }
-
-    #[test]
-    fn test_lzw_roundtrip_long_repetitive() {
-        // 长重复序列：触发字典增长与表满
-        let mut data = Vec::new();
-        let mut x = 12345u32;
-        for _ in 0..200_000 {
-            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-            data.push((x >> 24) as u8);
-            data.push((x >> 28) as u8);
-        }
-        roundtrip(&data, 8);
-    }
-
-    #[test]
-    fn test_lzw_table_overflow() {
-        // 高熵数据强制字典打满并多次重置
-        let mut data = Vec::with_capacity(300_000);
-        let mut x = 987654321u64;
-        for _ in 0..300_000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            data.push((x >> 33) as u8);
-        }
-        roundtrip(&data, 8);
-    }
-
-    #[test]
-    fn test_lzw_zero_length_runs() {
-        let mut data = vec![5u8; 70000];
-        data.extend(std::iter::repeat_n(9, 70000));
-        data.extend((0..60000).map(|i| (i % 251) as u8));
-        roundtrip(&data, 8);
-    }
 
     #[test]
     fn test_octree_palette_size() {
@@ -707,46 +397,5 @@ mod tests {
         assert_eq!(bbox, (0, 1, 3, 1));
         let out = crop_diff(&d, &a, w, bbox, 0xFF);
         assert_eq!(out, vec![5, 0xFF, 6]);
-    }
-
-    #[test]
-    fn test_gif_container_structure() {
-        // 两帧 4x4 图，写完检查关键结构字节
-        let pal: Vec<[u8; 3]> = (0..16).map(|i| [i * 16, i * 8, i * 4]).collect();
-        let mut buf = Vec::new();
-        {
-            let mut g = GifWriter::new(&mut buf, 4, 4, &pal, 4).unwrap();
-            let f1 = vec![3u8; 16];
-            g.write_frame(&f1, 0, 0, 4, 4, 7, false).unwrap();
-            let mut f2 = f1.clone();
-            f2[0] = 5;
-            let cropped = crop_diff(&f2, &f1, 4, diff_bbox(&f2, &f1, 4, 4).unwrap(), 15);
-            g.write_frame(&cropped, 0, 0, 1, 1, 7, true).unwrap();
-            g.finish().unwrap();
-        }
-        assert_eq!(&buf[0..6], b"GIF89a");
-        assert_eq!(buf[6], 4); // width 低字节
-        assert_eq!(buf[10], 0x80 | (3 << 4) | 3); // LSD packed: GCT 标志 + bits-1
-        assert_eq!(*buf.last().unwrap(), 0x3B);
-        // 结构化解析：跳过 header 后应恰好遇到 GCE+图像描述符 ×2，然后 trailer
-        let mut p = 6 + 7 + 16 * 3 + 19; // header + LSD + GCT + NETSCAPE 扩展
-        let mut frames = 0usize;
-        while p < buf.len() && buf[p] != 0x3B {
-            assert_eq!(buf[p], 0x21, "预期图形控制扩展");
-            assert_eq!(buf[p + 1], 0xF9);
-            // 第一帧不带透明标志，第二帧（帧差分）带
-            assert_eq!(buf[p + 3] & 0x01, if frames == 1 { 1 } else { 0 });
-            p += 8; // GCE: 21 F9 04 packed delay trans 00
-            assert_eq!(buf[p], 0x2C, "预期图像描述符");
-            p += 10; // 2C + left/top/w/h + packed
-            p += 1; // LZW min code size
-            while buf[p] != 0 {
-                p += 1 + buf[p] as usize; // 跳子块
-            }
-            p += 1; // 子块终结符
-            frames += 1;
-        }
-        assert_eq!(frames, 2);
-        assert_eq!(p, buf.len() - 1); // 仅剩 trailer
     }
 }
