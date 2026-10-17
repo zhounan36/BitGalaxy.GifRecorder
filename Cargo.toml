@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2024"
 description = "BitGalaxy.GifRecorder - 轻量级 GIF 录屏工具"
 authors = ["BitGalaxy"]
+license = "MIT"
 
 [[bin]]
 name = "bitgalaxy_gifrecorder"
