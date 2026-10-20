@@ -2,9 +2,12 @@
 //! 控制窗口 + 系统托盘 + 全局热键（F9 开始/停止，F10 取消）+ 拖拽选区 + 保存对话框。
 //! 录制期间：区域红色脉冲边框 + 悬浮控制条（画在区域外侧，不入镜）+ 托盘图标/时长反馈。
 //! 录制产物：无损帧缓存 → 编辑器（预览/剪切/裁切）→ GIF 导出。
+//!
+//! 控制台子系统：CLI/MCP 调用可被 shell 正常等待并取回退出码；
+//! GUI 模式（无参数）以 DETACHED_PROCESS 分离重启自身，避免常驻控制台窗口。
 
-// release 用 windows 子系统：双击运行不弹黑色控制台；debug 保留控制台便于调试
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+/// GUI 分离重启的内部标记参数
+const ARG_GUI: &str = "__bgr_gui__";
 
 mod automation;
 mod cache;
@@ -1035,12 +1038,66 @@ fn register_class(
 }
 
 fn main() {
-    // 带命令行参数 → CLI / MCP 模式（供 AI 与脚本调用）；无参数 → 图形界面
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
+    if args.len() == 1 && args[0] == ARG_GUI {
+        // 分离重启后的 GUI 子进程（无控制台）
+        unsafe { gui_main() };
+    } else if args.is_empty() {
+        // GUI 模式：分离重启自身后立即退出（失败则原地启动）
+        unsafe {
+            if !relaunch_gui() {
+                gui_main();
+            }
+        }
+    } else {
+        // 命令行参数 → CLI / MCP 模式（供 AI 与脚本调用）
         std::process::exit(cli::run(&args));
     }
-    unsafe { gui_main() }
+}
+
+/// 以 DETACHED_PROCESS 重启自身进入 GUI 模式。
+/// 双击启动：父进程控制台窗口只闪现一帧即随退出关闭；从 shell 启动：立即归还提示符。
+/// 返回 false = 重启失败（调用方应原地运行 GUI 兜底）。
+unsafe fn relaunch_gui() -> bool {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    unsafe {
+        let mut path = [0u16; 1024];
+        let n = GetModuleFileNameW(None, &mut path) as usize;
+        if n == 0 || n >= path.len() {
+            return false;
+        }
+        let exe = String::from_utf16_lossy(&path[..n]);
+        let app = to_wide(&exe);
+        let mut cmd = to_wide(&format!("\"{exe}\" {ARG_GUI}"));
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        let ok = CreateProcessW(
+            PCWSTR(app.as_ptr()),
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS,
+            None,
+            PCWSTR::null(),
+            &si,
+            &mut pi,
+        )
+        .is_ok();
+        if ok {
+            let _ = CloseHandle(pi.hProcess);
+            let _ = CloseHandle(pi.hThread);
+        }
+        ok
+    }
 }
 
 unsafe fn gui_main() {

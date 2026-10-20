@@ -21,6 +21,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+    "Win32_Security",
     "Win32_UI_Shell",
 ] }
 # GIF 容器与 LZW 压缩（纯 Rust）；量化/抖动/帧差分仍为本项目实现
