@@ -6,11 +6,15 @@
 // release 用 windows 子系统：双击运行不弹黑色控制台；debug 保留控制台便于调试
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod automation;
 mod cache;
 mod capture;
+mod cli;
 mod editor;
 mod export;
 mod gif;
+mod json;
+mod mcp;
 mod overlay;
 mod recorder;
 mod tray;
@@ -1031,6 +1035,15 @@ fn register_class(
 }
 
 fn main() {
+    // 带命令行参数 → CLI / MCP 模式（供 AI 与脚本调用）；无参数 → 图形界面
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(cli::run(&args));
+    }
+    unsafe { gui_main() }
+}
+
+unsafe fn gui_main() {
     unsafe {
         let hmodule = GetModuleHandleW(None).expect("GetModuleHandleW");
         let hinst = HINSTANCE(hmodule.0);

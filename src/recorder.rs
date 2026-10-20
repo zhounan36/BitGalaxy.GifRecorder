@@ -63,16 +63,25 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start(cfg: Config, notify: HWND) -> Self {
+        Self::spawn(cfg, Some(notify))
+    }
+
+    /// 无 UI 通知（CLI / MCP 自动化）：录制结束不投递消息，由调用方 finish() 取结果
+    pub fn start_headless(cfg: Config) -> Self {
+        Self::spawn(cfg, None)
+    }
+
+    fn spawn(cfg: Config, notify: Option<HWND>) -> Self {
         let (tx, rx) = channel::<Cmd>();
         let frames = Arc::new(AtomicU64::new(0));
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis())
             .unwrap_or(0);
         let cache = std::env::temp_dir().join(format!("bgr_edit_{ts}.cache"));
         let f = frames.clone();
         let cache_in = cache.clone();
-        let notify_in = HwndSend(notify.0 as usize);
+        let notify_in = notify.map(|h| HwndSend(h.0 as usize));
         let join = std::thread::Builder::new()
             .name("gif-recorder".into())
             .spawn(move || run(cfg, rx, f, notify_in, cache_in))
@@ -101,7 +110,7 @@ fn run(
     cfg: Config,
     rx: Receiver<Cmd>,
     frames: Arc<AtomicU64>,
-    notify: HwndSend,
+    notify: Option<HwndSend>,
     cache: PathBuf,
 ) -> Outcome {
     let t0 = Instant::now();
@@ -116,13 +125,15 @@ fn run(
         Ok(None) => Outcome::Cancelled,
         Err(e) => Outcome::Failed(e),
     };
-    unsafe {
-        let _ = PostMessageW(
-            Some(notify.get()),
-            WM_REC_DONE,
-            Default::default(),
-            Default::default(),
-        );
+    if let Some(n) = notify {
+        unsafe {
+            let _ = PostMessageW(
+                Some(n.get()),
+                WM_REC_DONE,
+                Default::default(),
+                Default::default(),
+            );
+        }
     }
     out
 }

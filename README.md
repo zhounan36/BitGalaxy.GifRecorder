@@ -60,6 +60,63 @@
 3. 按 `F9`（或点击「开始录制」）开始，录制完成后自动进入编辑器
 4. 预览 → 剪切/裁切/变速 → 「导出 GIF」保存
 
+## 命令行与 AI 集成（CLI / MCP）
+
+同一个 EXE 内置无 GUI 自动化接口，专为 AI 助手与脚本设计：**结果以 JSON 输出到 stdout，进度输出到 stderr**，退出码 `0`=成功、`1`=失败。
+
+### CLI
+
+```powershell
+# 录制区域 (100,100,800,600) 共 5 秒，15fps，导出到 out.gif
+bitgalaxy_gifrecorder.exe record -o D:\out.gif -d 5 -r 100,100,800,600 -f 15 -s 100
+
+# 录制 10 秒并 2 倍速导出
+bitgalaxy_gifrecorder.exe record -o D:\out.gif -d 10 --speed 2
+
+# 单帧截图（单帧 GIF）
+bitgalaxy_gifrecorder.exe snapshot -o D:\shot.gif -r 0,0,1920,1080
+
+# 列出显示器与虚拟屏坐标（region 坐标系参考）
+bitgalaxy_gifrecorder.exe screens
+```
+
+`record` 输出示例：
+
+```json
+{"ok":true,"output":"D:\\out.gif","frames":72,"duration_ms":5012,"size_bytes":458721,"truncated":false}
+```
+
+### MCP 服务器（stdio）
+
+```powershell
+bitgalaxy_gifrecorder.exe mcp
+```
+
+在 Claude Desktop / Trae / Cursor 等 MCP 客户端中配置：
+
+```json
+{
+  "mcpServers": {
+    "gifrecorder": {
+      "command": "C:\\path\\to\\bitgalaxy_gifrecorder.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+提供 7 个工具：
+
+| 工具 | 说明 |
+|------|------|
+| `screens` | 枚举显示器与虚拟屏坐标（物理像素），供选择 region |
+| `record_gif` | 录制指定时长并导出 GIF（region / fps / scale_percent / speed） |
+| `snapshot_gif` | 单帧截图，保存为单帧 GIF |
+| `start_record` / `stop_record` / `cancel_record` | 会话式录制：开始 →（AI 执行其他操作）→ 停止导出 / 丢弃 |
+| `get_status` | 查询当前录制状态（时长、帧数） |
+
+典型 AI 工作流：`screens` 查坐标 → `record_gif`（一步出图），或 `start_record` → 执行操作 → `stop_record`（录下 AI 自己的操作过程）。
+
 ## 从源码构建
 
 需要 Rust（edition 2024，建议 1.85+）和 MSVC 工具链。
@@ -98,7 +155,7 @@ cargo test
 
 | 模块 | 职责 |
 |------|------|
-| `src/main.rs` | 入口、主窗口、选区、热键、录制状态机 |
+| `src/main.rs` | 入口（GUI/CLI 分流）、主窗口、选区、热键、录制状态机 |
 | `src/capture.rs` | GDI 屏幕捕获（CAPTUREBLT 含分层窗口） |
 | `src/recorder.rs` | 录制线程：固定节奏抓帧、无损压缩落盘 |
 | `src/cache.rs` | 自研 BGRC 帧缓存格式（关键帧 + 差分帧） |
@@ -107,6 +164,10 @@ cargo test
 | `src/gif.rs` | 八叉树量化、FS 抖动、帧差分（含单元测试） |
 | `src/overlay.rs` | 红框 / 蓝框 / 控制条 / 倒计时覆盖层 |
 | `src/tray.rs` | 托盘图标与菜单 |
+| `src/json.rs` | 极简 JSON 解析/序列化（CLI/MCP 共用，零依赖） |
+| `src/automation.rs` | 无 GUI 自动化核心：录屏直出 GIF、截图、显示器枚举、会话录制 |
+| `src/cli.rs` | 命令行接口（record / snapshot / screens / mcp） |
+| `src/mcp.rs` | MCP stdio 服务器（JSON-RPC 2.0，7 个工具） |
 
 **录制/编码分离**：录制路径只做无损搬运，量化与编码推迟到导出侧 —— 录制期 CPU 占用低，且同一段录制可反复以不同参数导出。
 
