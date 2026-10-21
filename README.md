@@ -44,6 +44,7 @@
 
 ### 其他
 
+- 现代暗色 UI：暗色标题栏（Win10 1809+）、圆角窗口（Win11）、圆角卡片布局、自绘彩色按钮与下拉框
 - 系统托盘常驻：最小化到托盘不影响录制，explorer 重启后自动恢复图标
 - Per-Monitor V2 高 DPI 完整适配，高分屏不糊
 - 中文原生 UI
@@ -92,7 +93,21 @@ bitgalaxy_gifrecorder.exe screens
 bitgalaxy_gifrecorder.exe mcp
 ```
 
-在 Claude Desktop / Trae / Cursor 等 MCP 客户端中配置：
+#### 一键安装 / 卸载
+
+主窗口底部「MCP · AI 集成」面板（或 CLI）可把本程序自动注册进本机已安装的 AI 客户端，无需手改 JSON：
+
+- **一键安装**：自动写入 **Trae / Claude Desktop / Cursor / Windsurf / VS Code** 的 MCP 配置（只新增/更新 `gifrecorder` 条目，其余配置原样保留），重启客户端后生效
+- **状态显示**：实时显示每个客户端「✓已注册 / ✗未注册 / 未检测到」
+- **卸载**：从所有客户端配置中移除本程序条目；安装时新建的空配置文件会被一并删除
+
+```powershell
+bitgalaxy_gifrecorder.exe mcp-status    # 查询注册状态（JSON）
+bitgalaxy_gifrecorder.exe mcp-install   # 一键注册到已检测到的客户端
+bitgalaxy_gifrecorder.exe mcp-uninstall # 从所有客户端移除注册
+```
+
+手动配置（等效）：
 
 ```json
 {
@@ -166,8 +181,9 @@ cargo test
 | `src/tray.rs` | 托盘图标与菜单 |
 | `src/json.rs` | 极简 JSON 解析/序列化（CLI/MCP 共用，零依赖） |
 | `src/automation.rs` | 无 GUI 自动化核心：录屏直出 GIF、截图、显示器枚举、会话录制 |
-| `src/cli.rs` | 命令行接口（record / snapshot / screens / mcp） |
+| `src/cli.rs` | 命令行接口（record / snapshot / screens / mcp / mcp-install / mcp-uninstall / mcp-status） |
 | `src/mcp.rs` | MCP stdio 服务器（JSON-RPC 2.0，7 个工具） |
+| `src/mcp_install.rs` | MCP 一键安装/卸载：写入或移除 AI 客户端的 MCP 配置并检测安装状态 |
 
 **录制/编码分离**：录制路径只做无损搬运，量化与编码推迟到导出侧 —— 录制期 CPU 占用低，且同一段录制可反复以不同参数导出。
 

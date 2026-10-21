@@ -77,6 +77,13 @@ impl Json {
         s
     }
 
+    /// 带缩进的多行输出（2 空格），用于写回用户配置文件
+    pub fn to_string_pretty(&self) -> String {
+        let mut s = String::new();
+        self.write_pretty(&mut s, 0);
+        s
+    }
+
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -105,6 +112,45 @@ impl Json {
                 }
                 out.push('}');
             }
+        }
+    }
+    fn write_pretty(&self, out: &mut String, depth: usize) {
+        let pad = |out: &mut String, d: usize| {
+            for _ in 0..d {
+                out.push_str("  ");
+            }
+        };
+        match self {
+            Json::Arr(v) if !v.is_empty() => {
+                out.push_str("[\n");
+                for (i, item) in v.iter().enumerate() {
+                    pad(out, depth + 1);
+                    item.write_pretty(out, depth + 1);
+                    if i + 1 < v.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Obj(m) if !m.is_empty() => {
+                out.push_str("{\n");
+                for (i, (k, v)) in m.iter().enumerate() {
+                    pad(out, depth + 1);
+                    write_str(k, out);
+                    out.push_str(": ");
+                    v.write_pretty(out, depth + 1);
+                    if i + 1 < m.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                pad(out, depth);
+                out.push('}');
+            }
+            // 空数组/空对象/标量沿用紧凑形式
+            _ => self.write(out),
         }
     }
 }
@@ -211,6 +257,7 @@ impl<'a> Parser<'a> {
             let k = self.string()?;
             self.ws();
             self.eat(b':')?;
+            self.ws(); // "key": value —— 冒号后允许空白（pretty-printed 配置）
             let v = self.value(depth + 1)?;
             m.push((k, v));
             self.ws();
@@ -234,6 +281,7 @@ impl<'a> Parser<'a> {
             return Ok(Json::Arr(v));
         }
         loop {
+            self.ws(); // 逗号/左括号后允许空白
             v.push(self.value(depth + 1)?);
             self.ws();
             match self.b.get(self.i) {
@@ -393,6 +441,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_whitespace() {
+        // pretty-printed JSON（冒号/逗号后有空格、多行）必须可解析
+        let src = "{\n  \"a\": 1,\n  \"b\": [ 1, 2, 3 ],\n  \"c\": { \"d\": \"x\" }\n}";
+        let v = parse(src).unwrap();
+        assert_eq!(v.get("a").unwrap().as_f64(), Some(1.0));
+        assert_eq!(v.get("b").unwrap().as_arr().unwrap().len(), 3);
+    }
+
+    #[test]
     fn test_parse_errors() {
         assert!(parse("{").is_err());
         assert!(parse("{} x").is_err());
@@ -410,5 +467,25 @@ mod tests {
         assert_eq!(Json::s("x\u{1}y").to_string(), "\"x\\u0001y\"");
         assert_eq!(Json::obj(vec![]).to_string(), "{}");
         assert_eq!(Json::arr(vec![]).to_string(), "[]");
+    }
+
+    #[test]
+    fn test_pretty() {
+        let v = Json::obj(vec![
+            ("a", Json::i(1)),
+            ("b", Json::obj(vec![("c", Json::arr(vec![Json::s("x")]))])),
+        ]);
+        let pretty = v.to_string_pretty();
+        assert_eq!(
+            pretty,
+            "{\n  \"a\": 1,\n  \"b\": {\n    \"c\": [\n      \"x\"\n    ]\n  }\n}"
+        );
+        // 内层空对象/数组保持紧凑，外层仍多行
+        assert_eq!(
+            Json::obj(vec![("e", Json::obj(vec![]))]).to_string_pretty(),
+            "{\n  \"e\": {}\n}"
+        );
+        // pretty 输出可再解析
+        assert_eq!(parse(&pretty).unwrap(), v);
     }
 }

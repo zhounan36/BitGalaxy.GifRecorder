@@ -16,6 +16,9 @@ BitGalaxy GIF 录屏 —— 命令行 / AI 接口（无参数启动则进入图�
   bitgalaxy_gifrecorder snapshot -o <out.gif> [-r <x,y,w,h>] [-s <百分比>]
   bitgalaxy_gifrecorder screens
   bitgalaxy_gifrecorder mcp
+  bitgalaxy_gifrecorder mcp-status
+  bitgalaxy_gifrecorder mcp-install
+  bitgalaxy_gifrecorder mcp-uninstall
   bitgalaxy_gifrecorder help
 
 命令:
@@ -23,6 +26,9 @@ BitGalaxy GIF 录屏 —— 命令行 / AI 接口（无参数启动则进入图�
   snapshot  截取当前屏幕单帧，保存为单帧 GIF
   screens   列出显示器与虚拟屏坐标（物理像素，JSON）
   mcp       作为 MCP（Model Context Protocol）stdio 服务器运行，供 AI 客户端调用
+  mcp-status    查询本机 AI 客户端的 MCP 注册状态（JSON）
+  mcp-install   把本程序一键注册进已检测到的 AI 客户端（Trae / Claude Desktop / Cursor / Windsurf / VS Code）
+  mcp-uninstall 从所有 AI 客户端配置中移除本程序的 MCP 注册
   help      显示本帮助
 
 选项:
@@ -45,6 +51,42 @@ pub fn run(args: &[String]) -> i32 {
             0
         }
         "mcp" => crate::mcp::run(),
+        "mcp-status" => {
+            use crate::json::Json;
+            let clients: Vec<Json> = crate::mcp_install::scan()
+                .into_iter()
+                .map(|c| {
+                    Json::obj(vec![
+                        ("client", Json::s(c.name)),
+                        ("detected", Json::Bool(c.detected)),
+                        ("installed", Json::Bool(c.installed)),
+                    ])
+                })
+                .collect();
+            print_json(&Json::obj(vec![
+                ("ok", Json::Bool(true)),
+                ("clients", Json::arr(clients)),
+            ]));
+            0
+        }
+        "mcp-install" => {
+            let r = crate::mcp_install::install();
+            print_json(&result_json(&r));
+            if r.ok.is_empty() {
+                1
+            } else {
+                0
+            }
+        }
+        "mcp-uninstall" => {
+            let r = crate::mcp_install::uninstall();
+            print_json(&result_json(&r));
+            if r.ok.is_empty() {
+                1
+            } else {
+                0
+            }
+        }
         "help" | "-h" | "--help" | "/?" => {
             println!("{USAGE}");
             0
@@ -197,6 +239,21 @@ fn print_json(v: &Json) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{}", v.to_string());
     let _ = out.flush();
+}
+
+/// mcp-install / mcp-uninstall 的结果 JSON
+fn result_json(r: &crate::mcp_install::ChangeResult) -> Json {
+    Json::obj(vec![
+        ("ok", Json::Bool(!r.ok.is_empty())),
+        (
+            "done",
+            Json::arr(r.ok.iter().map(|s| Json::s(s.clone())).collect()),
+        ),
+        (
+            "failed",
+            Json::arr(r.failed.iter().map(|s| Json::s(s.clone())).collect()),
+        ),
+    ])
 }
 
 fn fail(e: &str) -> i32 {

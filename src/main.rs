@@ -1,7 +1,9 @@
 //! BitGalaxy.GifRecorder —— 轻量级 GIF 录屏工具。
-//! 控制窗口 + 系统托盘 + 全局热键（F9 开始/停止，F10 取消）+ 拖拽选区 + 保存对话框。
+//! 控制窗口（暗色现代 UI）+ 系统托盘 + 全局热键（F9 开始/停止，F10 取消）+ 拖拽选区 + 保存对话框。
 //! 录制期间：区域红色脉冲边框 + 悬浮控制条（画在区域外侧，不入镜）+ 托盘图标/时长反馈。
 //! 录制产物：无损帧缓存 → 编辑器（预览/剪切/裁切）→ GIF 导出。
+//! 主窗口「MCP · AI 集成」面板：一键把本程序注册进 Trae / Claude Desktop / Cursor 等
+//! AI 客户端的 MCP 配置（安装状态实时显示，可一键卸载）。
 //!
 //! 控制台子系统：CLI/MCP 调用可被 shell 正常等待并取回退出码；
 //! GUI 模式（无参数）以 DETACHED_PROCESS 分离重启自身，避免常驻控制台窗口。
@@ -18,6 +20,7 @@ mod export;
 mod gif;
 mod json;
 mod mcp;
+mod mcp_install;
 mod overlay;
 mod recorder;
 mod tray;
@@ -28,40 +31,50 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, HINSTANCE, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWM_WINDOW_CORNER_PREFERENCE,
+};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetDC, GetDeviceCaps, GetStockObject,
-    InvalidateRect, LOGPIXELSY, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER, DT_SINGLELINE,
-    FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT, HDC, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
-    WHITE_BRUSH,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetDC, GetDeviceCaps, GetStockObject, InvalidateRect, LOGPIXELSY, SelectObject,
+    SetBkColor, SetBkMode, SetTextColor, UpdateWindow, BLACK_BRUSH, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_CENTER, DT_LEFT,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD, FW_NORMAL, HBRUSH,
+    HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT, WHITE_BRUSH,
 };
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_HIDEREADONLY, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Controls::BST_CHECKED;
+use windows::Win32::UI::Controls::{
+    SetWindowTheme, BST_CHECKED, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_DISABLED, ODS_SELECTED,
+    ODT_BUTTON, ODT_COMBOBOX,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, MOD_NOREPEAT,
-    VK_ESCAPE, VK_F10, VK_F9,
+    EnableWindow, IsWindowEnabled, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+    MOD_NOREPEAT, VK_ESCAPE, VK_F10, VK_F9,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, BM_GETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CreateWindowExW, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GWLP_USERDATA, HICON, HMENU, IDC_ARROW, IDC_CROSS,
-    IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_ICONASTERISK, MB_ICONERROR, MB_ICONWARNING,
-    MB_OK, MB_OKCANCEL, MessageBoxW, PostMessageW, PostQuitMessage,
+    AdjustWindowRect, BM_GETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW, CB_ADDSTRING,
+    CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CBS_DROPDOWNLIST,
+    CBS_OWNERDRAWFIXED, CreateWindowExW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GWLP_USERDATA, HICON, HMENU,
+    IDC_ARROW, IDC_CROSS, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_ICONASTERISK,
+    MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MessageBoxW, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, IDOK, LWA_ALPHA,
     MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
     SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_TIMER,
+    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_CTLCOLORBTN, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
 };
 
 use recorder::{Config, Outcome, Recorder};
@@ -72,11 +85,55 @@ const CLASS_SEL: &str = "BGR_SEL";
 const IDC_BTN_SELECT: i32 = 1001;
 const IDC_BTN_START: i32 = 1002;
 const IDC_BTN_CANCEL: i32 = 1003;
+const IDC_BTN_MCP_INSTALL: i32 = 1004;
+const IDC_BTN_MCP_UNINSTALL: i32 = 1005;
+const IDC_CB_FPS: i32 = 1011;
+const IDC_CB_SCALE: i32 = 1012;
 
 const WM_REGION_PICKED: u32 = WM_APP + 0x11;
 
 const FPS_OPTIONS: [u32; 7] = [8, 10, 12, 15, 20, 25, 30];
 const SCALE_OPTIONS: [u32; 3] = [100, 75, 50];
+
+// ============================================================
+// 暗色主题（自绘主窗口 + 自绘按钮/下拉框）
+// ============================================================
+
+/// 0x00BBGGRR
+const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
+    COLORREF(((b & 0xFF) << 16) | ((g & 0xFF) << 8) | (r & 0xFF))
+}
+
+const CLR_BG: COLORREF = rgb(30, 31, 36); // 窗口底
+const CLR_CARD: COLORREF = rgb(38, 40, 47); // 卡片底
+const CLR_CARD_BORDER: COLORREF = rgb(53, 56, 66); // 卡片描边
+const CLR_FIELD: COLORREF = rgb(45, 48, 56); // 下拉框底
+const CLR_FIELD_BORDER: COLORREF = rgb(61, 65, 76);
+const CLR_TEXT: COLORREF = rgb(232, 234, 237);
+const CLR_TEXT_SUB: COLORREF = rgb(154, 160, 170);
+const CLR_TEXT_DIM: COLORREF = rgb(106, 111, 123); // 禁用态文字
+const CLR_SEL_HIGHLIGHT: COLORREF = rgb(57, 64, 77); // 下拉列表悬停/选中
+
+// 按钮（按下 = 加深）
+const BTN_PRIMARY: COLORREF = rgb(196, 43, 44); // 录制红
+const BTN_PRIMARY_DOWN: COLORREF = rgb(158, 34, 35);
+const BTN_ACCENT: COLORREF = rgb(47, 111, 222); // MCP 安装蓝
+const BTN_ACCENT_DOWN: COLORREF = rgb(37, 88, 176);
+const BTN_SEC_BG: COLORREF = rgb(46, 49, 56);
+const BTN_SEC_BG_DOWN: COLORREF = rgb(38, 41, 49);
+const BTN_SEC_BORDER: COLORREF = rgb(63, 67, 78);
+const CLR_WHITE: COLORREF = rgb(255, 255, 255);
+const CLR_BTN_SEC_TEXT: COLORREF = rgb(216, 219, 226);
+
+/// 主窗口逻辑布局（96dpi 基准，实际随 DPI 缩放）
+mod layout {
+    pub const W: i32 = 420;
+    pub const H: i32 = 476;
+    /// 卡片 1（录制设置）
+    pub const CARD1: (i32, i32, i32, i32) = (12, 64, 396, 240);
+    /// 卡片 2（MCP · AI 集成）
+    pub const CARD2: (i32, i32, i32, i32) = (12, 316, 396, 140);
+}
 
 /// 选区窗口 → 主窗口 的区域回传
 static PICKED: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
@@ -102,6 +159,13 @@ struct App {
     hwnd: HWND,
     dpi: u32,
     font: HFONT,
+    font_title: HFONT,
+    font_sec: HFONT,
+    font_btn: HFONT,
+    font_small: HFONT,
+    brush_card: HBRUSH,
+    brush_field: HBRUSH,
+    brush_bg: HBRUSH,
     rec: Option<Recorder>,
     rec_started: Option<Instant>,
     region: Option<(i32, i32, i32, i32)>,
@@ -125,6 +189,10 @@ struct App {
     btn_cancel: HWND,
     cb_countdown: HWND,
     lbl_status: HWND,
+    // MCP 面板
+    lbl_mcp_status: HWND,
+    btn_mcp_install: HWND,
+    btn_mcp_uninstall: HWND,
 }
 
 impl App {
@@ -134,6 +202,13 @@ impl App {
             hwnd: HWND::default(),
             dpi,
             font: HFONT::default(),
+            font_title: HFONT::default(),
+            font_sec: HFONT::default(),
+            font_btn: HFONT::default(),
+            font_small: HFONT::default(),
+            brush_card: HBRUSH(std::ptr::null_mut()),
+            brush_field: HBRUSH(std::ptr::null_mut()),
+            brush_bg: HBRUSH(std::ptr::null_mut()),
             rec: None,
             rec_started: None,
             region: None,
@@ -152,6 +227,9 @@ impl App {
             btn_cancel: HWND::default(),
             cb_countdown: HWND::default(),
             lbl_status: HWND::default(),
+            lbl_mcp_status: HWND::default(),
+            btn_mcp_install: HWND::default(),
+            btn_mcp_uninstall: HWND::default(),
         }
     }
 
@@ -160,18 +238,18 @@ impl App {
         v * self.dpi as i32 / 96
     }
 
-    unsafe fn create_font(&mut self) {
+    unsafe fn make_font(&mut self, height: i32, weight: i32) -> HFONT {
         unsafe {
             let mut face = [0u16; 32];
             for (i, c) in "Microsoft YaHei UI".encode_utf16().take(31).enumerate() {
                 face[i] = c;
             }
-            self.font = CreateFontW(
-                -self.s(12),
+            CreateFontW(
+                -self.s(height),
                 0,
                 0,
                 0,
-                FW_NORMAL.0 as i32,
+                weight,
                 0,
                 0,
                 0,
@@ -181,7 +259,20 @@ impl App {
                 CLEARTYPE_QUALITY,
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
                 PCWSTR::from_raw(face.as_ptr()),
-            );
+            )
+        }
+    }
+
+    unsafe fn create_font(&mut self) {
+        unsafe {
+            self.font = self.make_font(12, FW_NORMAL.0 as i32);
+            self.font_title = self.make_font(17, FW_BOLD.0 as i32);
+            self.font_sec = self.make_font(12, FW_BOLD.0 as i32);
+            self.font_btn = self.make_font(13, FW_BOLD.0 as i32);
+            self.font_small = self.make_font(11, FW_NORMAL.0 as i32);
+            self.brush_card = CreateSolidBrush(CLR_CARD);
+            self.brush_field = CreateSolidBrush(CLR_FIELD);
+            self.brush_bg = CreateSolidBrush(CLR_BG);
         }
     }
 
@@ -223,66 +314,106 @@ impl App {
 
     unsafe fn create_controls(&mut self) {
         unsafe {
-            self.cb_fps = self.child(
-                "COMBOBOX",
-                "",
-                WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_TABSTOP,
-                68, 10, 70, 200, 0,
-            );
+            // —— 卡片 1：录制设置 ——
+            // 自绘下拉框（CBS_OWNERDRAWFIXED：闭合态与列表项都由主窗口绘制）
+            let cb_style = WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED) as u32) | WS_TABSTOP;
+            self.cb_fps = self.child("COMBOBOX", "", cb_style, 66, 104, 62, 200, IDC_CB_FPS);
+            // Win11 22H2+：边框与系统箭头也切暗色（旧系统调用失败自动忽略）
+            let _ = SetWindowTheme(self.cb_fps, w!("DarkMode_CFD"), None);
             for f in FPS_OPTIONS {
                 let t = to_wide(&f.to_string());
                 let _ = send_msg(self.cb_fps, CB_ADDSTRING, 0, t.as_ptr() as isize);
             }
             let _ = send_msg(self.cb_fps, CB_SETCURSEL, 3, 0); // 默认 15fps
 
-            self.cb_scale = self.child(
-                "COMBOBOX",
-                "",
-                WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_TABSTOP,
-                208, 10, 76, 200, 0,
-            );
+            self.cb_scale = self.child("COMBOBOX", "", cb_style, 188, 104, 62, 200, IDC_CB_SCALE);
+            let _ = SetWindowTheme(self.cb_scale, w!("DarkMode_CFD"), None);
             for f in SCALE_OPTIONS {
                 let t = to_wide(&format!("{}%", f));
                 let _ = send_msg(self.cb_scale, CB_ADDSTRING, 0, t.as_ptr() as isize);
             }
             let _ = send_msg(self.cb_scale, CB_SETCURSEL, 0, 0); // 默认 100%
 
-            self.child("STATIC", "帧率:", WINDOW_STYLE(0), 16, 14, 48, 20, 0);
-            self.child("STATIC", "缩放:", WINDOW_STYLE(0), 156, 14, 48, 20, 0);
+            self.child("STATIC", "帧率", WINDOW_STYLE(0), 28, 109, 34, 16, 0);
+            self.child("STATIC", "缩放", WINDOW_STYLE(0), 150, 109, 34, 16, 0);
 
             self.btn_select = self.child(
                 "BUTTON",
                 "选择区域...",
-                WINDOW_STYLE(0),
-                300, 10, 104, 30, IDC_BTN_SELECT,
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+                276, 104, 120, 26, IDC_BTN_SELECT,
             );
-            self.lbl_region =
-                self.child("STATIC", "区域: 全部屏幕", WINDOW_STYLE(0), 16, 50, 388, 20, 0);
+            self.lbl_region = self.child(
+                "STATIC",
+                "区域: 全部屏幕",
+                WINDOW_STYLE(0),
+                28, 142, 356, 16, 0,
+            );
             self.btn_start = self.child(
                 "BUTTON",
-                "● 开始录制 (F9)",
-                WINDOW_STYLE(0),
-                16, 82, 388, 46, IDC_BTN_START,
+                "●  开始录制 (F9)",
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+                28, 166, 356, 42, IDC_BTN_START,
             );
             self.btn_cancel = self.child(
                 "BUTTON",
                 "取消录制 (F10)",
-                WINDOW_STYLE(0),
-                16, 140, 388, 32, IDC_BTN_CANCEL,
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+                28, 216, 356, 26, IDC_BTN_CANCEL,
             );
             let _ = EnableWindow(self.btn_cancel, false);
             self.cb_countdown = self.child(
                 "BUTTON",
                 "开始前倒计时 3 秒",
                 WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-                16, 186, 180, 20, 0,
+                28, 250, 200, 18, 0,
             );
+            // 暗色主题复选框（不支持的旧系统自动回退经典样式）
+            let _ = SetWindowTheme(self.cb_countdown, w!("DarkMode_Explorer"), None);
             self.lbl_status = self.child(
                 "STATIC",
                 "就绪。F9 开始/停止录制，F10 取消。",
-                WINDOW_STYLE(0),
-                16, 214, 388, 40, 0,
+                // SS_EDITCONTROL：让静态文本按宽度换行
+                WINDOW_STYLE(0x2000),
+                28, 268, 356, 30, 0,
             );
+
+            // —— 卡片 2：MCP · AI 集成 ——
+            self.child(
+                "STATIC",
+                "内置 MCP 服务器（stdio，7 个工具）：AI 客户端可直接录屏 / 截图并导出 GIF。",
+                WINDOW_STYLE(0x2000),
+                28, 354, 356, 30, 0,
+            );
+            self.lbl_mcp_status = self.child(
+                "STATIC",
+                "",
+                WINDOW_STYLE(0x2000),
+                28, 390, 356, 30, 0,
+            );
+            self.btn_mcp_install = self.child(
+                "BUTTON",
+                "一键安装 MCP",
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+                28, 424, 132, 26, IDC_BTN_MCP_INSTALL,
+            );
+            self.btn_mcp_uninstall = self.child(
+                "BUTTON",
+                "卸载",
+                WINDOW_STYLE(BS_OWNERDRAW as u32),
+                168, 424, 96, 26, IDC_BTN_MCP_UNINSTALL,
+            );
+            self.refresh_mcp_status();
+        }
+    }
+
+    /// 刷新 MCP 注册状态行与卸载按钮可用性
+    unsafe fn refresh_mcp_status(&mut self) {
+        unsafe {
+            let t = to_wide(&mcp_install::status_text());
+            let _ = SetWindowTextW(self.lbl_mcp_status, PCWSTR(t.as_ptr()));
+            let any = mcp_install::any_installed();
+            let _ = EnableWindow(self.btn_mcp_uninstall, any);
         }
     }
 
@@ -384,7 +515,7 @@ unsafe fn begin_recording(app: &mut App) {
         app.rec = Some(Recorder::start(cfg, app.hwnd));
         app.rec_started = Some(Instant::now());
 
-        let t = to_wide("■ 停止并保存 (F9)");
+        let t = to_wide("■  停止并保存 (F9)");
         let _ = SetWindowTextW(app.btn_start, PCWSTR(t.as_ptr()));
         let _ = EnableWindow(app.btn_cancel, true);
         let _ = EnableWindow(app.btn_select, false);
@@ -523,7 +654,7 @@ unsafe fn on_rec_done(app: &mut App) {
 
         destroy_overlays(app);
         show_selection_preview(app); // 区域仍保留，恢复选区指示
-        let t = to_wide("● 开始录制 (F9)");
+        let t = to_wide("●  开始录制 (F9)");
         let _ = SetWindowTextW(app.btn_start, PCWSTR(t.as_ptr()));
         let _ = EnableWindow(app.btn_cancel, false);
         let _ = EnableWindow(app.btn_select, true);
@@ -633,6 +764,287 @@ fn rec_overlay_texts(app: &App) -> Option<(String, String)> {
         format!("录制中 {mmss}"),
         format!("REC {mmss} · {} 帧 · {}", st.frames, fmt_kb(st.kb)),
     ))
+}
+
+// ============================================================
+// MCP 面板：一键安装 / 卸载
+// ============================================================
+
+unsafe fn on_mcp_install(app: &mut App) {
+    unsafe {
+        let r = mcp_install::install();
+        app.refresh_mcp_status();
+        let msg = r.install_message();
+        if r.ok.is_empty() {
+            let t = to_wide(&msg);
+            let cap = to_wide("MCP 安装失败");
+            let _ = MessageBoxW(
+                Some(app.hwnd),
+                PCWSTR(t.as_ptr()),
+                PCWSTR(cap.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        } else if let Some(t) = app.tray.as_mut() {
+            t.balloon("MCP 已安装", &msg, r.failed.is_empty());
+        }
+    }
+}
+
+unsafe fn on_mcp_uninstall(app: &mut App) {
+    unsafe {
+        let r = mcp_install::uninstall();
+        app.refresh_mcp_status();
+        let msg = r.uninstall_message();
+        if r.ok.is_empty() {
+            let t = to_wide(&msg);
+            let cap = to_wide("MCP 卸载");
+            let _ = MessageBoxW(
+                Some(app.hwnd),
+                PCWSTR(t.as_ptr()),
+                PCWSTR(cap.as_ptr()),
+                MB_OK | MB_ICONWARNING,
+            );
+        } else if let Some(t) = app.tray.as_mut() {
+            t.balloon("MCP 已卸载", &msg, r.failed.is_empty());
+        }
+    }
+}
+
+// ============================================================
+// 主窗口暗色自绘（背景 / 标题 / 卡片 / 自绘按钮 / 自绘下拉框）
+// ============================================================
+
+/// 主窗口整体绘制：底色 + 页头 + 两张圆角卡片
+unsafe fn paint_main(dc: HDC, app: &App) {
+    unsafe {
+        // 1) 底色
+        let mut rc = RECT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(app.hwnd, &mut rc);
+        FillRect(dc, &rc, app.brush_bg);
+
+        // 2) 页头
+        let title = to_wide("BitGalaxy GIF 录屏");
+        draw_text_at(
+            dc,
+            app.font_title,
+            CLR_TEXT,
+            &title,
+            20, 12, 400, 38,
+            DT_LEFT | DT_SINGLELINE,
+        );
+        let sub = to_wide(&format!(
+            "轻量级 GIF 录屏 · 纯 Rust 单文件 · v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+        draw_text_at(
+            dc,
+            app.font_small,
+            CLR_TEXT_SUB,
+            &sub,
+            21, 40, 400, 20,
+            DT_LEFT | DT_SINGLELINE,
+        );
+
+        // 3) 卡片
+        draw_card(dc, app, layout::CARD1);
+        draw_card(dc, app, layout::CARD2);
+
+        // 4) 卡片标题
+        let sec1 = to_wide("录制设置");
+        draw_text_at(dc, app.font_sec, CLR_TEXT, &sec1, 28, 76, 200, 18, DT_LEFT | DT_SINGLELINE);
+        let sec2 = to_wide("MCP · AI 集成");
+        draw_text_at(dc, app.font_sec, CLR_TEXT, &sec2, 28, 328, 200, 18, DT_LEFT | DT_SINGLELINE);
+        let badge = to_wide("stdio · 7 个工具");
+        draw_text_at(
+            dc,
+            app.font_small,
+            CLR_TEXT_SUB,
+            &badge,
+            260, 331, 134, 16,
+            DT_RIGHT | DT_SINGLELINE,
+        );
+    }
+}
+
+unsafe fn draw_text_at(
+    dc: HDC,
+    font: HFONT,
+    color: COLORREF,
+    text: &[u16],
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    flags: DRAW_TEXT_FORMAT,
+) {
+    unsafe {
+        let old = SelectObject(dc, font.into());
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, color);
+        let mut rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        let mut buf = text.to_vec();
+        let _ = DrawTextW(dc, &mut buf, &mut rc, flags);
+        let _ = SelectObject(dc, old);
+    }
+}
+
+/// 圆角卡片：填充 + 描边
+unsafe fn draw_card(dc: HDC, app: &App, (x, y, w, h): (i32, i32, i32, i32)) {
+    unsafe {
+        let (sx, sy, sw, sh) = (app.s(x), app.s(y), app.s(w), app.s(h));
+        let r = app.s(10);
+        let brush = CreateSolidBrush(CLR_CARD);
+        let pen = CreatePen(PS_SOLID, 1, CLR_CARD_BORDER);
+        let old_b = SelectObject(dc, brush.into());
+        let old_p = SelectObject(dc, pen.into());
+        let _ = windows::Win32::Graphics::Gdi::RoundRect(dc, sx, sy, sx + sw, sy + sh, r * 2, r * 2);
+        let _ = SelectObject(dc, old_b);
+        let _ = SelectObject(dc, old_p);
+        let _ = DeleteObject(pen.into());
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// 自绘按钮：主操作（红）/ 强调（蓝）/ 次要（灰）
+unsafe fn draw_button(app: &App, dis: &DRAWITEMSTRUCT) {
+    unsafe {
+        let dc = dis.hDC;
+        let rc = dis.rcItem;
+        let id = dis.CtlID as i32;
+        let down = (dis.itemState.0 & ODS_SELECTED.0) != 0;
+        let disabled =
+            (dis.itemState.0 & ODS_DISABLED.0) != 0 || !IsWindowEnabled(dis.hwndItem).as_bool();
+
+        let (fill, border, textc, bold, radius) = match id {
+            IDC_BTN_START => {
+                (if down { BTN_PRIMARY_DOWN } else { BTN_PRIMARY }, BTN_PRIMARY, CLR_WHITE, true, app.s(9))
+            }
+            IDC_BTN_MCP_INSTALL => {
+                (if down { BTN_ACCENT_DOWN } else { BTN_ACCENT }, BTN_ACCENT, CLR_WHITE, false, app.s(7))
+            }
+            _ => (
+                if down { BTN_SEC_BG_DOWN } else { BTN_SEC_BG },
+                BTN_SEC_BORDER,
+                if disabled { CLR_TEXT_DIM } else { CLR_BTN_SEC_TEXT },
+                false,
+                app.s(7),
+            ),
+        };
+
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(PS_SOLID, 1, border);
+        let old_b = SelectObject(dc, brush.into());
+        let old_p = SelectObject(dc, pen.into());
+        let _ = windows::Win32::Graphics::Gdi::RoundRect(
+            dc, rc.left, rc.top, rc.right, rc.bottom, radius * 2, radius * 2,
+        );
+        let _ = SelectObject(dc, old_b);
+        let _ = SelectObject(dc, old_p);
+        let _ = DeleteObject(pen.into());
+        let _ = DeleteObject(brush.into());
+
+        // 按钮文字
+        let len = GetWindowTextLengthW(dis.hwndItem).max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let n = GetWindowTextW(dis.hwndItem, &mut buf);
+        let text = &buf[..n.max(0) as usize];
+        let font = if bold { app.font_btn } else { app.font };
+        let old_f = SelectObject(dc, font.into());
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, textc);
+        let mut trc = RECT {
+            left: rc.left + 2,
+            top: rc.top + (if down { 1 } else { 0 }),
+            right: rc.right - 2,
+            bottom: rc.bottom,
+        };
+        let _ = DrawTextW(dc, &mut text.to_vec(), &mut trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        let _ = SelectObject(dc, old_f);
+    }
+}
+
+/// 自绘下拉框：闭合态（含右侧箭头）与展开列表项
+unsafe fn draw_combo(app: &App, dis: &DRAWITEMSTRUCT) {
+    unsafe {
+        let dc = dis.hDC;
+        let rc = dis.rcItem;
+        let closed = dis.itemID == 0xFFFF_FFFF;
+
+        // 背板
+        let (bg, show_border) = if closed {
+            (CLR_FIELD, true)
+        } else if (dis.itemState.0 & ODS_SELECTED.0) != 0 {
+            (CLR_SEL_HIGHLIGHT, false)
+        } else {
+            (CLR_CARD, false)
+        };
+        let brush = CreateSolidBrush(bg);
+        let pen = if show_border { Some(CreatePen(PS_SOLID, 1, CLR_FIELD_BORDER)) } else { None };
+        let old_p = pen.map(|p| SelectObject(dc, p.into()));
+        let old_b = SelectObject(dc, brush.into());
+        let radius = app.s(5);
+        let _ = windows::Win32::Graphics::Gdi::RoundRect(
+            dc, rc.left, rc.top, rc.right, rc.bottom, radius * 2, radius * 2,
+        );
+        let _ = SelectObject(dc, old_b);
+        let _ = DeleteObject(brush.into());
+        if let (Some(p), Some(old)) = (pen, old_p) {
+            let _ = SelectObject(dc, old);
+            let _ = DeleteObject(p.into());
+        }
+
+        // 文本
+        let text: Vec<u16> = if closed {
+            combo_text(dis.hwndItem, None)
+        } else {
+            combo_text(dis.hwndItem, Some(dis.itemID))
+        };
+        let old_f = SelectObject(dc, app.font.into());
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let _ = SetTextColor(dc, if text.is_empty() { CLR_TEXT_DIM } else { CLR_TEXT });
+        let mut trc = RECT {
+            left: rc.left + app.s(8),
+            top: rc.top,
+            right: rc.right - app.s(16),
+            bottom: rc.bottom,
+        };
+        let _ = DrawTextW(dc, &mut text.to_vec(), &mut trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        let _ = SelectObject(dc, old_f);
+
+        // 闭合态右侧下拉箭头
+        if closed {
+            let mut arrow = to_wide("▾");
+            arrow.pop(); // 去掉结尾 NUL
+            let old_f2 = SelectObject(dc, app.font_small.into());
+            let _ = SetTextColor(dc, CLR_TEXT_SUB);
+            let mut arc = RECT {
+                left: rc.right - app.s(18),
+                top: rc.top,
+                right: rc.right - app.s(4),
+                bottom: rc.bottom,
+            };
+            let _ = DrawTextW(dc, &mut arrow, &mut arc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            let _ = SelectObject(dc, old_f2);
+        }
+    }
+}
+
+/// 取下拉框文本：None = 当前选中项；Some(i) = 第 i 项
+fn combo_text(hwnd: HWND, index: Option<u32>) -> Vec<u16> {
+    {
+        let idx = match index {
+            Some(i) => i as isize,
+            None => send_msg(hwnd, CB_GETCURSEL, 0, 0).0,
+        };
+        if idx < 0 {
+            return vec![];
+        }
+        let len = send_msg(hwnd, CB_GETLBTEXTLEN, idx as usize, 0).0.max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let _ = send_msg(hwnd, CB_GETLBTEXT, idx as usize, buf.as_mut_ptr() as isize);
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        buf[..end].to_vec()
+    }
 }
 
 // ============================================================
@@ -838,6 +1250,8 @@ unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         IDC_BTN_SELECT => on_select_clicked(app),
                         IDC_BTN_START => toggle_rec(app),
                         IDC_BTN_CANCEL => cancel_recording(app),
+                        IDC_BTN_MCP_INSTALL => on_mcp_install(app),
+                        IDC_BTN_MCP_UNINSTALL => on_mcp_uninstall(app),
                         tray::IDM_SHOW => {
                             let _ = ShowWindow(hwnd, SW_SHOW);
                             let _ = SetForegroundWindow(hwnd);
@@ -849,6 +1263,76 @@ unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     }
                 }
                 LRESULT(0)
+            }
+            // —— 暗色自绘 ——
+            WM_ERASEBKGND => LRESULT(1), // 统一在 WM_PAINT 绘制，避免闪烁
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut ps);
+                if let Some(app) = app_of(hwnd) {
+                    paint_main(dc, app);
+                }
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_DRAWITEM => {
+                let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
+                if dis.CtlType == ODT_BUTTON {
+                    if let Some(app) = app_of(hwnd) {
+                        draw_button(app, dis);
+                    }
+                    LRESULT(1)
+                } else if dis.CtlType == ODT_COMBOBOX {
+                    if let Some(app) = app_of(hwnd) {
+                        draw_combo(app, dis);
+                    }
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
+            WM_MEASUREITEM => {
+                // 自绘下拉框行高
+                let mi = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
+                if mi.CtlType == ODT_COMBOBOX {
+                    if let Some(app) = app_of(hwnd) {
+                        mi.itemHeight = app.s(20) as u32;
+                    }
+                }
+                LRESULT(1)
+            }
+            // 静态文本（全部位于卡片上）：卡片底色 + 浅色文字
+            WM_CTLCOLORSTATIC => {
+                let dc = HDC(wp.0 as *mut c_void);
+                let _ = SetTextColor(dc, CLR_TEXT_SUB);
+                let _ = SetBkColor(dc, CLR_CARD);
+                if let Some(app) = app_of(hwnd) {
+                    LRESULT(app.brush_card.0 as isize)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
+            // 复选框文字背景
+            WM_CTLCOLORBTN => {
+                let dc = HDC(wp.0 as *mut c_void);
+                let _ = SetTextColor(dc, CLR_TEXT_SUB);
+                let _ = SetBkColor(dc, CLR_CARD);
+                if let Some(app) = app_of(hwnd) {
+                    LRESULT(app.brush_card.0 as isize)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
+            }
+            // 下拉列表背景
+            WM_CTLCOLORLISTBOX => {
+                let dc = HDC(wp.0 as *mut c_void);
+                let _ = SetTextColor(dc, CLR_TEXT);
+                let _ = SetBkColor(dc, CLR_CARD);
+                if let Some(app) = app_of(hwnd) {
+                    LRESULT(app.brush_card.0 as isize)
+                } else {
+                    DefWindowProcW(hwnd, msg, wp, lp)
+                }
             }
             WM_HOTKEY => {
                 let Some(app) = app_of(hwnd) else { return LRESULT(0) };
@@ -977,6 +1461,13 @@ unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                             t.remove();
                             t.destroy();
                         }
+                        // 释放字体与画刷
+                        for f in [app.font, app.font_title, app.font_sec, app.font_btn, app.font_small] {
+                            let _ = DeleteObject(f.into());
+                        }
+                        for b in [app.brush_card, app.brush_field, app.brush_bg] {
+                            let _ = DeleteObject(b.into());
+                        }
                     }
                     drop(Box::from_raw(p as *mut App));
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1019,6 +1510,7 @@ fn register_class(
     proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
     cursor: PCWSTR,
     icon: HICON,
+    brush: HBRUSH,
 ) -> u16 {
     unsafe {
         let mut cls = to_wide(name);
@@ -1029,7 +1521,7 @@ fn register_class(
             hInstance: hinst,
             hCursor: LoadCursorW(None, cursor).unwrap_or_default(),
             hIcon: icon,
-            hbrBackground: HBRUSH(16usize as *mut c_void), // COLOR_BTNFACE + 1
+            hbrBackground: brush,
             lpszClassName: PCWSTR(cls.as_ptr()),
             ..Default::default()
         };
@@ -1118,15 +1610,23 @@ unsafe fn gui_main() {
         TASKBAR_CREATED.store(RegisterWindowMessageW(PCWSTR(tbc.as_ptr())), AtomicOrdering::Relaxed);
 
         let app_icon = load_app_icon(hinst);
-        register_class(hinst, CLASS_MAIN, main_wndproc, IDC_ARROW, app_icon);
-        register_class(hinst, CLASS_SEL, sel_wndproc, IDC_CROSS, HICON::default());
+        // 主窗口自绘暗色背景（类画刷置空）；选区窗口自带半透明黑底
+        register_class(hinst, CLASS_MAIN, main_wndproc, IDC_ARROW, app_icon, HBRUSH(std::ptr::null_mut()));
+        register_class(
+            hinst,
+            CLASS_SEL,
+            sel_wndproc,
+            IDC_CROSS,
+            HICON::default(),
+            HBRUSH(16usize as *mut c_void), // COLOR_BTNFACE + 1
+        );
         overlay::register_classes(hinst);
         editor::register_class(hinst);
 
         let app = Box::new(App::new(hinst, dpi));
 
-        // 客户区 420×284（逻辑）→ 外框尺寸
-        let mut rect = RECT { left: 0, top: 0, right: 420, bottom: 284 };
+        // 客户区（逻辑）→ 外框尺寸
+        let mut rect = RECT { left: 0, top: 0, right: layout::W, bottom: layout::H };
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let _ = AdjustWindowRect(&mut rect, style, false);
         let w = (rect.right - rect.left) * dpi as i32 / 96;
@@ -1151,6 +1651,22 @@ unsafe fn gui_main() {
             Some(Box::into_raw(app) as *const c_void),
         )
         .expect("CreateWindowExW");
+
+        // Win10 1809+：暗色标题栏；Win11：圆角窗口（旧系统调用失败自动忽略）
+        let dark = windows::core::BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as *const c_void,
+            std::mem::size_of_val(&dark) as u32,
+        );
+        let round = DWM_WINDOW_CORNER_PREFERENCE(2); // DWMWCP_ROUND
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &round as *const _ as *const c_void,
+            std::mem::size_of_val(&round) as u32,
+        );
 
         let _ = RegisterHotKey(Some(hwnd), 1, MOD_NOREPEAT, VK_F9.0 as u32);
         let _ = RegisterHotKey(Some(hwnd), 2, MOD_NOREPEAT, VK_F10.0 as u32);
