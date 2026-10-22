@@ -60,7 +60,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, BM_GETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW, CB_ADDSTRING,
-    CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CBS_DROPDOWNLIST,
+    CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
     CBS_OWNERDRAWFIXED, CreateWindowExW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GWLP_USERDATA, HICON, HMENU,
@@ -315,8 +315,8 @@ impl App {
     unsafe fn create_controls(&mut self) {
         unsafe {
             // —— 卡片 1：录制设置 ——
-            // 自绘下拉框（CBS_OWNERDRAWFIXED：闭合态与列表项都由主窗口绘制）
-            let cb_style = WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED) as u32) | WS_TABSTOP;
+            // 自绘下拉框（CBS_OWNERDRAWFIXED + CBS_HASSTRINGS：列表仍存储字符串，主窗口负责绘制）
+            let cb_style = WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32) | WS_TABSTOP;
             self.cb_fps = self.child("COMBOBOX", "", cb_style, 66, 104, 62, 200, IDC_CB_FPS);
             // Win11 22H2+：边框与系统箭头也切暗色（旧系统调用失败自动忽略）
             let _ = SetWindowTheme(self.cb_fps, w!("DarkMode_CFD"), None);
